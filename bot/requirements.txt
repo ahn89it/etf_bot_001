@@ -1,0 +1,20 @@
+# 키움 API
+PyQt5==5.15.9
+QScintilla==2.13.3
+
+# 데이터베이스
+pymysql==1.1.0
+cryptography==41.0.7
+
+# 데이터 처리
+pandas==2.1.4
+numpy==1.26.2
+
+# 스케줄링
+schedule==1.2.0
+
+# 로깅 (기본 포함)
+# logging
+
+# 기타
+python-dateutil==2.8.2

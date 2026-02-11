@@ -1,0 +1,13 @@
+Metadata-Version: 2.1
+Name: pykiwoom
+Version: 0.1.6
+Summary: python wrapper for Kiwoom Open API+ (Korea Stock Market)
+Home-page: https://github.com/sharebook-kr/pykiwoom
+Author: Lukas Yoo, Brayden Jo
+Author-email: brayden.jo@pyquant.co.kr, jonghun.yoo@pyquant.co.kr
+License: MIT
+License-File: LICENSE
+Requires-Dist: pandas
+Requires-Dist: pyqt5
+Requires-Dist: pywin32
+
