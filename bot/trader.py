@@ -21,16 +21,10 @@ logger = logging.getLogger(__name__)
 
 class ETFTrader:
     """ETF 자동매매 트레이더"""
+
     
     def __init__(self, account_password=None):
-        """
-        초기화
-        
-        Parameters:
-        -----------
-        account_password : str, optional
-            계좌 비밀번호 (4자리)
-        """
+        """초기화"""
         logger.info("=" * 60)
         logger.info("트레이더 초기화 시작")
         logger.info("=" * 60)
@@ -60,6 +54,7 @@ class ETFTrader:
         logger.info("5/5 상태 로드 중...")
         self.positions = {}
         self.selected_stocks = []
+        self.pending_orders = set()  # ★★★ 추가: 주문 중인 종목 ★★★
         self.state_file = './trading_state.json'
         self.load_state()
         logger.info("    ✓ 상태 로드 완료")
@@ -67,6 +62,7 @@ class ETFTrader:
         logger.info("=" * 60)
         logger.info("트레이더 초기화 완료!")
         logger.info("=" * 60)
+
     
     def save_state(self):
         """상태 저장"""
@@ -177,40 +173,54 @@ class ETFTrader:
         buy_candidates = []
         
         for code, score, name in self.selected_stocks:
+            # ★★★ 이미 보유 중인 종목 제외 ★★★
             if code in self.positions:
                 logger.info(f"{name} ({code}): 이미 보유 중")
                 continue
             
-            signal = self.strategy.check_buy_signal(code)
+            # ★★★ 주문 처리 중인 종목 제외 (중복 주문 방지) ★★★
+            if code in self.pending_orders:
+                logger.info(f"{name} ({code}): 주문 처리 중")
+                continue
             
-            if signal and signal['signal']:
-                buy_candidates.append({
-                    'code': code,
-                    'name': name,
-                    'trigger_price': signal['trigger_price']
-                })
-                logger.info(f"{name} ({code}): 매수 신호 발생!")
+            try:
+                # 실시간 현재가 조회
+                logger.info(f"{name} ({code}): 현재가 조회 중...")
+                current_price = self.api.get_current_price(code)
+                
+                if current_price == 0:
+                    logger.warning(f"{name} ({code}): 현재가 조회 실패")
+                    continue
+                
+                logger.info(f"{name} ({code}): 실시간 현재가 {current_price:,.0f}원")
+                
+                # 매수 신호 확인 (현재가 전달)
+                signal = self.strategy.check_buy_signal(code, current_price)
+                
+                if signal and signal['signal']:
+                    buy_candidates.append({
+                        'code': code,
+                        'name': name,
+                        'trigger_price': signal['trigger_price']
+                    })
+                    logger.info(f"{name} ({code}): 매수 신호 발생!")
+                else:
+                    logger.info(f"{name} ({code}): 매수 조건 미충족")
+                
+            except Exception as e:
+                logger.error(f"{name} ({code}) 매수 신호 확인 오류: {e}")
+                continue
         
         if not buy_candidates:
             logger.info("매수 신호 없음")
             return []
         
         return self.execute_buy_orders(buy_candidates)
+
+
     
     def execute_buy_orders(self, buy_candidates):
-        """
-        매수 주문 실행
-        
-        Parameters:
-        -----------
-        buy_candidates : list
-            매수 후보 종목 리스트
-        
-        Returns:
-        --------
-        list
-            매수 성공한 종목 리스트
-        """
+        """매수 주문 실행"""
         logger.info("\n" + "=" * 60)
         logger.info(f"매수 실행: {len(buy_candidates)}개 종목")
         logger.info("=" * 60)
@@ -219,53 +229,43 @@ class ETFTrader:
         total_deposit = self.api.get_deposit()
         logger.info(f"전체 예수금: {total_deposit:,}원")
         
-        # 투자 금액 계산
+        # 투자 금액 계산 (기존 코드 유지)
         try:
             from config import INVESTMENT_CONFIG
             
-            # 고정 금액 모드
             if INVESTMENT_CONFIG.get('use_fixed', False):
                 available_cash = INVESTMENT_CONFIG['fixed_amount']
                 logger.info(f"고정 금액 모드: {available_cash:,}원")
-            
-            # 종목당 금액 모드
             elif 'per_stock_amount' in INVESTMENT_CONFIG:
                 per_stock = INVESTMENT_CONFIG['per_stock_amount']
                 available_cash = per_stock * len(buy_candidates)
                 logger.info(f"종목당 금액 모드: {per_stock:,}원 × {len(buy_candidates)}개")
-            
-            # 비율 모드 (기본)
             else:
                 use_ratio = INVESTMENT_CONFIG.get('use_ratio', 1.0)
                 available_cash = int(total_deposit * use_ratio)
                 logger.info(f"비율 모드: {use_ratio*100}% = {available_cash:,}원")
             
-            # 최소 현금 보유액 체크
             min_reserve = INVESTMENT_CONFIG.get('min_cash_reserve', 0)
             if min_reserve > 0:
                 if total_deposit - available_cash < min_reserve:
                     available_cash = max(0, total_deposit - min_reserve)
                     logger.info(f"최소 현금 보유: {min_reserve:,}원 유지")
             
-            # 최대 투자 금액 체크
             max_investment = INVESTMENT_CONFIG.get('max_investment', float('inf'))
             if available_cash > max_investment:
                 available_cash = max_investment
                 logger.info(f"최대 투자 제한: {max_investment:,}원")
             
-            # 예수금 초과 체크
             if available_cash > total_deposit:
                 available_cash = total_deposit
                 logger.warning(f"예수금 부족: {total_deposit:,}원만 사용")
             
         except ImportError:
-            # INVESTMENT_CONFIG 없으면 전액 사용
             available_cash = total_deposit
             logger.info("투자 설정 없음 - 전액 사용")
         
         logger.info(f"실제 투자 금액: {available_cash:,}원")
         
-        # 최소 투자 금액 체크
         if available_cash < 10000:
             logger.error("투자 가능 금액 부족 (최소 1만원)")
             return []
@@ -273,7 +273,6 @@ class ETFTrader:
         # 균등 분할
         num_stocks = len(buy_candidates)
         allocation_per_stock = available_cash / num_stocks
-        
         logger.info(f"종목당 배분: {allocation_per_stock:,.0f}원")
         
         bought_stocks = []
@@ -284,6 +283,9 @@ class ETFTrader:
             trigger_price = candidate['trigger_price']
             
             try:
+                # ★★★ 주문 중 플래그 설정 (중복 주문 방지) ★★★
+                self.pending_orders.add(code)
+                
                 # 수량 계산
                 quantity = self.strategy.calculate_position_size(
                     allocation_per_stock, 1, trigger_price
@@ -291,6 +293,7 @@ class ETFTrader:
                 
                 if quantity == 0:
                     logger.warning(f"{name}: 수량 0 (매수 불가)")
+                    self.pending_orders.discard(code)
                     continue
                 
                 # 매수 주문
@@ -298,24 +301,64 @@ class ETFTrader:
                 
                 result = self.api.buy(code, quantity, int(trigger_price))
                 
-                if result.get('success'):
-                    # 포지션 기록
-                    self.positions[code] = {
-                        'entry_date': datetime.now().strftime('%Y-%m-%d'),
-                        'entry_price': trigger_price,
-                        'quantity': quantity,
-                        'hold_days': 0
-                    }
+                # 체결 확인
+                if not result:
+                    logger.error(f"{name} 주문 결과 없음")
+                    self.pending_orders.discard(code)
+                    continue
+                
+                if result.get('success') and result.get('status') == '체결':
+                    # 실제 체결 완료
+                    exec_qty = result.get('exec_qty', quantity)
+                    exec_price = result.get('exec_price', trigger_price)
+                    
+                    # ★★★ 중복 체결 처리 (수량 합산) ★★★
+                    if code in self.positions:
+                        logger.warning(f"{name} 중복 체결 감지! 수량 합산")
+                        
+                        existing = self.positions[code]
+                        total_qty = existing['quantity'] + exec_qty
+                        
+                        # 평균 단가 계산
+                        total_cost = (existing['entry_price'] * existing['quantity'] + 
+                                    exec_price * exec_qty)
+                        avg_price = total_cost / total_qty
+                        
+                        self.positions[code]['quantity'] = total_qty
+                        self.positions[code]['entry_price'] = int(avg_price)
+                        
+                        logger.info(f"  기존: {existing['quantity']}주 @ {existing['entry_price']:,}원")
+                        logger.info(f"  추가: {exec_qty}주 @ {exec_price:,}원")
+                        logger.info(f"  합계: {total_qty}주 @ {int(avg_price):,}원")
+                    else:
+                        # 신규 포지션
+                        self.positions[code] = {
+                            'entry_date': datetime.now().strftime('%Y-%m-%d'),
+                            'entry_time': datetime.now().strftime('%H:%M:%S'),
+                            'entry_price': exec_price,
+                            'quantity': exec_qty,
+                            'order_no': result.get('order_no', '')
+                        }
+                        logger.info(f"✅ {name} 매수 체결 완료: {exec_qty}주 @ {exec_price:,}원")
                     
                     bought_stocks.append(code)
-                    logger.info(f"{name} 매수 성공!")
+                    
+                    # ★★★ 주문 중 플래그 해제 ★★★
+                    self.pending_orders.discard(code)
                     
                     time.sleep(TRADING_CONFIG['order_delay'])
+                
+                elif result.get('status') == '접수':
+                    logger.warning(f"⚠️ {name} 주문 접수됨 (미체결) - 포지션 저장 안 함")
+                    # ★★★ 플래그는 유지 (다음 루틴에서 중복 주문 방지) ★★★
+                
                 else:
-                    logger.error(f"{name} 매수 실패")
+                    logger.error(f"❌ {name} 매수 실패: {result}")
+                    self.pending_orders.discard(code)
             
             except Exception as e:
                 logger.error(f"{name} 매수 오류: {e}")
+                self.pending_orders.discard(code)
                 continue
         
         # 상태 저장
@@ -324,7 +367,7 @@ class ETFTrader:
         logger.info(f"\n매수 완료: {len(bought_stocks)}개 종목")
         return bought_stocks
 
-    
+
     def check_sell_signals(self):
         """매도 신호 확인 및 실행"""
         if not self.positions:
@@ -337,31 +380,48 @@ class ETFTrader:
         
         sell_candidates = []
         
-        for code, position in self.positions.items():
-            name = ETF_UNIVERSE.get(code, {}).get('name', 'Unknown')
+        for code, position in list(self.positions.items()):
+            try:
+                name = ETF_UNIVERSE.get(code, {}).get('name', 'Unknown')
+                
+                # ★★★ 영업일 기준 보유일 계산 ★★★
+                from utils import get_business_days
+                
+                entry_date = position['entry_date']  # 'YYYY-MM-DD' 문자열
+                today = datetime.now().strftime('%Y-%m-%d')
+                
+                hold_days = get_business_days(entry_date, today)
+                
+                logger.info(f"{name} ({code}): "
+                        f"보유일={hold_days}일 (영업일), "
+                        f"진입일={position['entry_date']}, "
+                        f"진입가={position['entry_price']:,.0f}원")
+                
+                # 매도 신호 확인 (hold_days 전달)
+                signal = self.strategy.check_sell_signal(code, position, hold_days)
+                
+                if signal and signal['signal']:
+                    sell_candidates.append({
+                        'code': code,
+                        'name': name,
+                        'position': position,
+                        'reason': signal['reason'],
+                        'sell_price': signal.get('sell_price', 0)
+                    })
+                    logger.info(f"🔴 {name}: 매도 신호 ({signal['reason']})")
+                else:
+                    logger.info(f"  → 보유 유지")
             
-            logger.info(f"{name} ({code}): 보유일={position['hold_days']}일")
-            
-            signal = self.strategy.check_sell_signal(code, position)
-            
-            if signal and signal['signal']:
-                sell_candidates.append({
-                    'code': code,
-                    'name': name,
-                    'position': position,
-                    'reason': signal['reason'],
-                    'sell_price': signal['sell_price']
-                })
-                logger.info(f"{name}: 매도 신호 ({signal['reason']})")
-            else:
-                self.positions[code]['hold_days'] += 1
+            except Exception as e:
+                logger.error(f"{code} 매도 신호 확인 오류: {e}")
+                continue
         
         if not sell_candidates:
             logger.info("매도 신호 없음")
-            self.save_state()
             return []
         
         return self.execute_sell_orders(sell_candidates)
+
     
     def execute_sell_orders(self, sell_candidates):
         """매도 주문 실행"""
@@ -382,14 +442,20 @@ class ETFTrader:
                 
                 logger.info(f"{name} 매도 주문: {quantity}주 (사유: {reason})")
                 
+                # 시장가 매도
                 result = self.api.sell(code, quantity, 0)
                 
-                if result.get('success'):
+                # ★★★ 체결 확인 ★★★
+                if result.get('success') and result.get('status') == '체결':
                     entry_price = position['entry_price']
-                    sell_price = candidate['sell_price']
-                    profit_pct = (sell_price / entry_price - 1) * 100
+                    sell_price = result.get('exec_price', candidate.get('sell_price', 0))
                     
-                    logger.info(f"{name} 매도 성공!")
+                    if sell_price > 0:
+                        profit_pct = (sell_price / entry_price - 1) * 100
+                    else:
+                        profit_pct = 0
+                    
+                    logger.info(f"✅ {name} 매도 성공!")
                     logger.info(f"  진입가: {entry_price:,.0f}원")
                     logger.info(f"  매도가: {sell_price:,.0f}원")
                     logger.info(f"  수익률: {profit_pct:+.2f}%")
@@ -398,8 +464,12 @@ class ETFTrader:
                     sold_stocks.append(code)
                     
                     time.sleep(TRADING_CONFIG['order_delay'])
+                
+                elif result.get('status') == '접수':
+                    logger.warning(f"⚠️ {name} 매도 주문 접수됨 (미체결)")
+                
                 else:
-                    logger.error(f"{name} 매도 실패")
+                    logger.error(f"❌ {name} 매도 실패: {result}")
             
             except Exception as e:
                 logger.error(f"{name} 매도 오류: {e}")
@@ -408,7 +478,7 @@ class ETFTrader:
         self.save_state()
         logger.info(f"\n매도 완료: {len(sold_stocks)}개 종목")
         return sold_stocks
-    
+
     def need_rebalancing(self):
         """리밸런싱 필요 여부"""
         return len(self.positions) == 0

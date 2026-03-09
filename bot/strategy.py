@@ -137,14 +137,14 @@ class ETFStrategy:
     
     def check_buy_signal(self, code, current_price=None):
         """
-        매수 신호 확인
+        매수 신호 확인 (래리 윌리엄스 변동성 돌파 전략)
         
         Parameters:
         -----------
         code : str
             종목코드
         current_price : float, optional
-            현재가
+            현재가 (None이면 최신 종가 사용)
         
         Returns:
         --------
@@ -152,47 +152,69 @@ class ETFStrategy:
             매수 신호 정보
         """
         try:
-            df = self.db.get_etf_data(code, days_back=2)
+            # 오늘 데이터 조회
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            df = self.db.get_etf_data(code, date=today_str, days_back=1)
             
-            if len(df) < 2:
-                logger.warning(f"{code}: 데이터 부족")
+            if df.empty:
+                logger.warning(f"{code}: 오늘 데이터 없음")
                 return None
             
             today = df.iloc[0]
-            yesterday = df.iloc[1]
             
-            # Trigger 가격 계산
-            yesterday_range = yesterday['High'] - yesterday['Low']
-            trigger_price = today['Open'] + self.k * yesterday_range
+            # 필수 데이터 확인
+            if pd.isna(today['Open']) or pd.isna(today['Low']):
+                logger.warning(f"{code}: 시가/저가 데이터 없음")
+                return None
             
-            # 현재가
+            # Trigger 계산
+            today_range = today['Open'] - today['Low']
+            trigger_price_raw = today['Open'] - (self.k * today_range)
+            
+            # ★★★ 호가 단위 조정 ★★★
+            trigger_price = self.adjust_price_to_tick(trigger_price_raw)
+            
+            # 현재가 (없으면 최신 종가 사용)
             if current_price is None:
-                current_price = today['High']
+                if pd.isna(today['Close']):
+                    logger.warning(f"{code}: 종가 데이터 없음")
+                    return None
+                current_price = today['Close']
             
-            # 매수 조건
+            # 매수 조건: 현재가 >= Trigger
             signal = current_price >= trigger_price
             
             result = {
                 'signal': signal,
                 'trigger_price': trigger_price,
                 'current_price': current_price,
-                'yesterday_range': yesterday_range,
+                'today_range': today_range,
                 'today_open': today['Open'],
-                'today_high': today['High']
+                'today_low': today['Low'],
+                'today_high': today['High'] if not pd.isna(today['High']) else None,
+                'k': self.k
             }
             
-            if signal:
-                logger.info(f"{code} 매수 신호!")
-                logger.info(f"  Trigger: {trigger_price:,.0f}원")
-                logger.info(f"  현재가: {current_price:,.0f}원")
+            # 로그 출력
+            name = ETF_UNIVERSE.get(code, {}).get('name', code)
+            logger.info(f"{name} ({code}) 매수 신호 체크:")
+            logger.info(f"  시가: {today['Open']:,.0f}원")
+            logger.info(f"  저가: {today['Low']:,.0f}원")
+            logger.info(f"  Range: {today_range:,.0f}원")
+            logger.info(f"  k: {self.k}")
+            logger.info(f"  Trigger (원본): {trigger_price_raw:,.2f}원")
+            logger.info(f"  Trigger (조정): {trigger_price:,.0f}원")
+            logger.info(f"  현재가: {current_price:,.0f}원")
+            logger.info(f"  신호: {'✅ 매수' if signal else '❌ 대기'}")
             
             return result
             
         except Exception as e:
             logger.error(f"{code} 매수 신호 확인 오류: {e}")
             return None
+
     
-    def check_sell_signal(self, code, position, current_price=None):
+    def check_sell_signal(self, code, position, hold_days, current_price=None):
         """
         매도 신호 확인
         
@@ -202,6 +224,8 @@ class ETFStrategy:
             종목코드
         position : dict
             포지션 정보
+        hold_days : int
+            보유일수 (trader.py에서 계산해서 전달)
         current_price : float, optional
             현재가
         
@@ -211,48 +235,59 @@ class ETFStrategy:
             매도 신호 정보
         """
         try:
-            df = self.db.get_etf_data(code, days_back=1)
+            # 오늘 데이터 조회
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            df = self.db.get_etf_data(code, date=today_str, days_back=1)
             
             if df.empty:
-                logger.warning(f"{code}: 데이터 없음")
+                logger.warning(f"{code}: 오늘 데이터 없음")
                 return None
             
             today = df.iloc[0]
             
             # 매수 당일 체크
-            today_str = datetime.now().strftime('%Y-%m-%d')
             if position['entry_date'] == today_str:
                 logger.debug(f"{code}: 매수 당일")
                 return {'signal': False, 'reason': '매수 당일'}
             
             # 현재가
             if current_price is None:
+                if pd.isna(today['Close']):
+                    logger.warning(f"{code}: 종가 데이터 없음")
+                    return None
                 current_price = today['Close']
             
-            # 조건 1: 손절
+            # ★★★ 조건 1: 손절 (SMA20 × 0.98 이탈) ★★★
             if not pd.isna(today['sma_20']):
                 sma20_threshold = today['sma_20'] * self.sma_buffer
                 
-                if today['Low'] < sma20_threshold:
-                    logger.info(f"{code} 손절 신호!")
+                if current_price < sma20_threshold:
+                    name = ETF_UNIVERSE.get(code, {}).get('name', code)
+                    logger.info(f"{name} ({code}) 손절 신호!")
+                    logger.info(f"  현재가: {current_price:,.0f}원")
+                    logger.info(f"  SMA(20): {today['sma_20']:,.0f}원")
+                    logger.info(f"  손절선: {sma20_threshold:,.0f}원")
                     
                     return {
                         'signal': True,
-                        'reason': 'SMA(20) 이탈',
+                        'reason': 'SMA(20) 손절',
                         'sell_price': current_price,
                         'sma20': today['sma_20'],
-                        'low': today['Low']
+                        'threshold': sma20_threshold
                     }
             
-            # 조건 2: 보유기간 도달
-            if position['hold_days'] >= self.hold_days:
-                logger.info(f"{code} 보유기간 도달 ({position['hold_days']}일)")
+            # ★★★ 조건 2: 보유기간 도달 ★★★
+            if hold_days >= self.hold_days:
+                name = ETF_UNIVERSE.get(code, {}).get('name', code)
+                logger.info(f"{name} ({code}) 보유기간 도달!")
+                logger.info(f"  보유일: {hold_days}일")
+                logger.info(f"  최대 보유일: {self.hold_days}일")
                 
                 return {
                     'signal': True,
                     'reason': f"{self.hold_days}일 도달",
                     'sell_price': current_price,
-                    'hold_days': position['hold_days']
+                    'hold_days': hold_days
                 }
             
             # 매도 조건 불만족
@@ -280,7 +315,7 @@ class ETFStrategy:
         int
             매수 수량
         """
-        if num_stocks == 0:
+        if num_stocks == 0 or stock_price == 0:
             return 0
         
         allocation = available_cash / num_stocks
@@ -294,24 +329,40 @@ class ETFStrategy:
         return quantity
 
 
-# ============================================================================
-# 테스트 코드
-# ============================================================================
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
+    def adjust_price_to_tick(self, price):
+        """
+        호가 단위에 맞게 가격 조정
+        
+        Parameters:
+        -----------
+        price : float
+            원본 가격
+        
+        Returns:
+        --------
+        int
+            호가 단위에 맞춘 가격
+        """
+        if price < 1000:
+            tick = 1
+        elif price < 5000:
+            tick = 5
+        elif price < 10000:
+            tick = 10
+        elif price < 50000:
+            tick = 50
+        elif price < 100000:
+            tick = 100
+        elif price < 500000:
+            tick = 500
+        else:
+            tick = 1000
+        
+        # 호가 단위로 내림
+        adjusted = int(price / tick) * tick
+        
+        logger.debug(f"가격 조정: {price:,.0f}원 → {adjusted:,.0f}원 (호가단위: {tick}원)")
+        
+        return adjusted
     
-    db = DatabaseManager()
-    strategy = ETFStrategy(db)
-    
-    print("\n=== 테스트: 모멘텀 선발 ===")
-    top_stocks = strategy.calculate_momentum_score()
-    
-    if top_stocks:
-        print("\n선발된 종목:")
-        for code, score, name in top_stocks:
-            print(f"  {name} ({code}): {score:.4f}")
-    
-    db.disconnect()
+

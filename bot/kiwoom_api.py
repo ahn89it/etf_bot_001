@@ -120,30 +120,49 @@ class KiwoomAPI:
         return self.deposit
 
     def get_balance(self):
-        """보유 종목 조회"""
+        """잔고 조회"""
         logger.info("잔고 조회 요청...")
         
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
         self.ocx.dynamicCall("SetInputValue(QString, QString)", "비밀번호", self.account_password)
-        self.ocx.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "01")  # 00 → 01
-        self.ocx.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "조회구분", "1")
         
-        ret = self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)", 
+        ret = self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)",
                                 "계좌평가잔고내역요청", "opw00018", 0, "0102")
         
         if ret != 0:
-            logger.error(f"잔고 조회 요청 실패: {ret}")
+            logger.error(f"잔고 조회 실패: {ret}")
             return {}
         
         logger.info("잔고 조회 요청 전송 완료, 응답 대기 중...")
         
         self.order_event_loop = QEventLoop()
-        QTimer.singleShot(10000, self.order_event_loop.quit)
+        
+        # ★★★ 타임아웃 15초로 증가 ★★★
+        QTimer.singleShot(15000, self.order_event_loop.quit)
+        
         self.order_event_loop.exec_()
         
         logger.info(f"잔고 조회 완료: {len(self.balance)}개 종목")
         
+        # ★★★ 잔고가 비어있으면 재시도 ★★★
+        if len(self.balance) == 0:
+            logger.warning("잔고 조회 결과가 비어있습니다. 1초 후 재시도...")
+            time.sleep(1)
+            
+            # 재시도
+            ret = self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)",
+                                    "계좌평가잔고내역요청", "opw00018", 0, "0102")
+            
+            if ret == 0:
+                self.order_event_loop = QEventLoop()
+                QTimer.singleShot(15000, self.order_event_loop.quit)
+                self.order_event_loop.exec_()
+                logger.info(f"재시도 결과: {len(self.balance)}개 종목")
+        
         return self.balance
+
 
     
     def send_order(self, order_type, code, quantity, price=0):
@@ -235,38 +254,70 @@ class KiwoomAPI:
             self.balance = {}
             
             count = self.ocx.dynamicCall("GetRepeatCnt(QString, QString)",
-                                         "opw00018", "계좌평가잔고내역요청")
+                                        "opw00018", "계좌평가잔고내역요청")
             
             logger.info(f"보유 종목 수: {count}개")
             
+            if count == 0:
+                logger.warning("잔고가 비어있습니다 (실제 보유 종목 확인 필요)")
+                return
+            
             for i in range(count):
-                code = self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
-                                           "opw00018", "계좌평가잔고내역요청", i, "종목번호").strip()
+                try:
+                    # 종목코드
+                    code = self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
+                                            "opw00018", "계좌평가잔고내역요청", i, "종목번호")
+                    
+                    if not code:
+                        logger.warning(f"인덱스 {i}: 종목코드 없음")
+                        continue
+                    
+                    code = code.strip()
+                    
+                    # A 제거
+                    if code.startswith('A'):
+                        code = code[1:]
+                    
+                    # 종목명
+                    name = self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
+                                            "opw00018", "계좌평가잔고내역요청", i, "종목명")
+                    name = name.strip() if name else "Unknown"
+                    
+                    # 보유수량
+                    quantity_str = self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
+                                                    "opw00018", "계좌평가잔고내역요청", i, "보유수량")
+                    quantity = int(quantity_str.strip()) if quantity_str else 0
+                    
+                    # 현재가
+                    price_str = self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
+                                                    "opw00018", "계좌평가잔고내역요청", i, "현재가")
+                    price = abs(int(price_str.strip())) if price_str else 0
+                    
+                    # 매입가
+                    buy_price_str = self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
+                                                        "opw00018", "계좌평가잔고내역요청", i, "매입가")
+                    buy_price = abs(int(buy_price_str.strip())) if buy_price_str else 0
+                    
+                    # 잔고 저장
+                    self.balance[code] = {
+                        'name': name,
+                        'quantity': quantity,
+                        'price': price,
+                        'buy_price': buy_price
+                    }
+                    
+                    logger.info(f"  {i+1}. {name} ({code}): {quantity}주 @ {price:,}원 (매입가: {buy_price:,}원)")
                 
-                name = self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
-                                           "opw00018", "계좌평가잔고내역요청", i, "종목명").strip()
-                
-                quantity = int(self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
-                                                   "opw00018", "계좌평가잔고내역요청", i, "보유수량").strip())
-                
-                price = abs(int(self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
-                                                     "opw00018", "계좌평가잔고내역요청", i, "현재가").strip()))
-                
-                buy_price = abs(int(self.ocx.dynamicCall("GetCommData(QString, QString, int, QString)",
-                                                         "opw00018", "계좌평가잔고내역요청", i, "매입가").strip()))
-                
-                self.balance[code] = {
-                    'name': name,
-                    'quantity': quantity,
-                    'price': price,
-                    'buy_price': buy_price
-                }
-                
-                logger.info(f"  - {name} ({code}): {quantity}주")
+                except Exception as e:
+                    logger.error(f"인덱스 {i} 파싱 오류: {e}")
+                    continue
+            
+            logger.info(f"잔고 파싱 완료: {len(self.balance)}개 종목")
             
         except Exception as e:
             logger.error(f"잔고 데이터 처리 오류: {e}")
             self.balance = {}
+
     
     def _process_current_price_data(self):
         """현재가 데이터 처리"""
@@ -279,23 +330,129 @@ class KiwoomAPI:
             self.current_price = 0
     
     def _on_receive_chejan_data(self, gubun, item_cnt, fid_list):
-        """체결 데이터 수신 이벤트"""
-        if gubun == "0":
-            order_no = self.ocx.dynamicCall("GetChejanData(int)", 9203)
-            code = self.ocx.dynamicCall("GetChejanData(int)", 9001)
-            order_status = self.ocx.dynamicCall("GetChejanData(int)", 913)
+        """
+        체결 데이터 수신 이벤트
+        
+        Parameters:
+        -----------
+        gubun : str
+            "0": 주문체결, "1": 잔고, "4": 파생잔고
+        item_cnt : int
+            아이템 개수
+        fid_list : str
+            FID 목록
+        """
+        try:
+            if gubun == "0":  # 주문체결
+                # 체결 정보 조회
+                order_no = self.ocx.dynamicCall("GetChejanData(int)", 9203)      # 주문번호
+                code = self.ocx.dynamicCall("GetChejanData(int)", 9001)          # 종목코드
+                order_status = self.ocx.dynamicCall("GetChejanData(int)", 913)   # 주문상태
+                order_qty = self.ocx.dynamicCall("GetChejanData(int)", 900)      # 주문수량
+                exec_qty = self.ocx.dynamicCall("GetChejanData(int)", 911)       # 체결수량
+                order_price = self.ocx.dynamicCall("GetChejanData(int)", 901)    # 주문가격
+                exec_price = self.ocx.dynamicCall("GetChejanData(int)", 910)     # 체결가격
+                
+                # 데이터 정리
+                code = code.strip()
+                order_status = order_status.strip()
+                
+                # A 제거
+                if code.startswith('A'):
+                    code = code[1:]
+                
+                # 수량/가격 변환
+                try:
+                    order_qty = int(order_qty.strip()) if order_qty else 0
+                    exec_qty = int(exec_qty.strip()) if exec_qty else 0
+                    order_price = int(order_price.strip()) if order_price else 0
+                    exec_price = abs(int(exec_price.strip())) if exec_price else 0
+                except:
+                    order_qty = 0
+                    exec_qty = 0
+                    order_price = 0
+                    exec_price = 0
+                
+                # 로그 출력
+                logger.info(f"체결 통보: "
+                        f"주문번호={order_no}, "
+                        f"종목={code}, "
+                        f"상태={order_status}, "
+                        f"주문={order_qty}주, "
+                        f"체결={exec_qty}주, "
+                        f"주문가={order_price:,}원, "
+                        f"체결가={exec_price:,}원")
+                
+                # ★★★ 상태별 처리 ★★★
+                if order_status == "체결":
+                    # 완전 체결
+                    self.order_result = {
+                        'success': True,
+                        'order_no': order_no,
+                        'code': code,
+                        'status': order_status,
+                        'order_qty': order_qty,
+                        'exec_qty': exec_qty,
+                        'order_price': order_price,
+                        'exec_price': exec_price
+                    }
+                    logger.info(f"✅ 체결 완료: {code}, {exec_qty}주 @ {exec_price:,}원")
+                    
+                    # 이벤트 루프 종료
+                    if self.order_event_loop and self.order_event_loop.isRunning():
+                        self.order_event_loop.exit()
+                
+                elif order_status == "접수":
+                    # 주문 접수 (아직 체결 안 됨)
+                    logger.info(f"📝 주문 접수: {code}, {order_qty}주 @ {order_price:,}원")
+                    # 이벤트 루프 종료하지 않음 (체결 대기)
+                
+                elif order_status == "확인":
+                    # 주문 확인
+                    logger.info(f"✅ 주문 확인: {code}")
+                
+                elif order_status == "거부":
+                    # 주문 거부
+                    self.order_result = {
+                        'success': False,
+                        'order_no': order_no,
+                        'code': code,
+                        'status': order_status,
+                        'reason': '주문 거부'
+                    }
+                    logger.error(f"❌ 주문 거부: {code}")
+                    
+                    # 이벤트 루프 종료
+                    if self.order_event_loop and self.order_event_loop.isRunning():
+                        self.order_event_loop.exit()
+                
+                elif order_status == "취소":
+                    # 주문 취소
+                    self.order_result = {
+                        'success': False,
+                        'order_no': order_no,
+                        'code': code,
+                        'status': order_status,
+                        'reason': '주문 취소'
+                    }
+                    logger.warning(f"⚠️ 주문 취소: {code}")
+                    
+                    # 이벤트 루프 종료
+                    if self.order_event_loop and self.order_event_loop.isRunning():
+                        self.order_event_loop.exit()
+                
+                else:
+                    # 기타 상태
+                    logger.info(f"ℹ️ 주문 상태: {order_status}")
             
-            logger.info(f"체결 통보: 주문번호={order_no}, 종목={code}, 상태={order_status}")
-            
-            self.order_result = {
-                'success': True,
-                'order_no': order_no,
-                'code': code,
-                'status': order_status
-            }
-            
-            if self.order_event_loop and self.order_event_loop.isRunning():
-                self.order_event_loop.exit()
+            elif gubun == "1":  # 잔고
+                # 잔고 변동 (필요시 처리)
+                pass
+        
+        except Exception as e:
+            logger.error(f"체결 통보 처리 오류: {e}")
+
+
     
     def _on_receive_real_data(self, code, real_type, real_data):
         """실시간 데이터 수신 이벤트"""
