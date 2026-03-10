@@ -8,6 +8,10 @@ from PyQt5.QtWidgets import QApplication
 from PyQt5.QAxContainer import QAxWidget
 from PyQt5.QtCore import QEventLoop, QTimer
 import logging
+import time 
+
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger(__name__)
 
